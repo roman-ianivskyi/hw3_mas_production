@@ -3,6 +3,11 @@ import json
 import re
 from datetime import datetime, timezone
 from mcp.server.fastmcp import FastMCP
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning,
+                        module="pydantic_settings")
+warnings.filterwarnings(
+    "ignore", message=".*IncompleteFieldDefinitionWarning.*")
 
 mcp = FastMCP(
     name='travel_support_server',

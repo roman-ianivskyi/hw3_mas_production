@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+import asyncio
+import os
 import operator
 import sqlite3
 import time
@@ -6,15 +9,16 @@ from pydantic import BaseModel, Field
 
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from tools_legacy import search_flights, search_hotels, search_attractions, book_flight
 from knowledge import search_knowledge
 from trajectory_logger import TrajectoryLogger
 
-from dotenv import load_dotenv
 load_dotenv()
 
 llm = ChatOpenAI(model="google/gemini-3.7-flash",
@@ -43,7 +47,7 @@ def log_agent_step(agent_name: str, step_num: int, node: str, input_data: str, o
 
 
 class RouteDecision(BaseModel):
-    action: Literal['planner', 'booking', 'researcher', 'general'] = Field(
+    action: Literal['planner', 'booking', 'researcher', 'support', 'general'] = Field(
         description='Цільовий агент або "general" для нерозпізнаних запитів'
     )
     reasoning: str = Field(description='Пояснення вибору')
@@ -55,6 +59,7 @@ SUPERVISOR_SYSTEM = """Ти — супервізор туристичного а
 - planner: комплексне планування подорожі, пошук квитків, готелів, локацій
 - booking: безпосереднє бронювання, оплата, підтвердження квитків
 - researcher: довідкові питання — візові правила, faq, туристичні політики, багаж
+- support: підтримка клієнтів, тікети, скарги, статуси звернень (CRM)
 - general: вітання, нерозпізнані запити"""
 
 
@@ -86,7 +91,7 @@ def planner_agent(state: MASState) -> dict:
     planner = llm.with_structured_output(Plan)
 
     plan = planner.invoke(
-        f"Створи план 1-3 кроки для планування подорожі: {user_msg}. Використовуй тільки доступні інструменти.")
+        f"Створи план 1-3 кроки: {user_msg}. Використовуй тільки доступні інструменти.")
 
     tool_executor = llm.bind_tools(
         [search_flights, search_hotels, search_attractions])
@@ -106,10 +111,8 @@ def planner_agent(state: MASState) -> dict:
         result = response.content
 
     final_msg = AIMessage(content=f"План виконано. Результат: {result}")
-
     log_agent_step('planner', state.get('step_count', 0),
                    'plan_and_execute', str(plan.steps), str(result))
-
     return {'messages': [final_msg], 'completed': True, 'step_count': state.get('step_count', 0) + 1}
 
 
@@ -153,7 +156,7 @@ def researcher_agent(state: MASState) -> dict:
     agent_llm = llm.bind_tools([search_knowledge])
     response = agent_llm.invoke([
         SystemMessage(
-            content="Ти дослідник туристичної бази знань. Завжди використовуй tool search_knowledge для відповідей.")
+            content="Ти дослідник туристичної бази знань. Використовуй tool search_knowledge.")
     ] + state['messages'])
 
     if hasattr(response, 'tool_calls') and response.tool_calls:
@@ -174,8 +177,45 @@ def researcher_agent(state: MASState) -> dict:
 def general_agent(state: MASState) -> dict:
     return {'messages': [AIMessage(content="Я загальний асистент. Уточніть, чим можу допомогти щодо вашої подорожі?")], 'completed': True}
 
+# ── Support Agent (MCP) ──
 
-def route(state: MASState) -> Literal['planner', 'booking', 'researcher', 'general', '__end__']:
+
+async def support_agent(state: MASState) -> dict:
+    global mcp_tools
+
+    agent_llm = llm.bind_tools(mcp_tools)
+    response = await agent_llm.ainvoke([
+        SystemMessage(
+            content="Ти агент підтримки. Завжди використовуй інструменти для роботи з тікетами.")
+    ] + state['messages'])
+
+    if hasattr(response, 'tool_calls') and response.tool_calls:
+        tc = response.tool_calls[0]
+        tool_fn = next((t for t in mcp_tools if t.name == tc['name']), None)
+        if tool_fn:
+            tool_res = await tool_fn.ainvoke(tc['args'])
+
+            # Просимо LLM сформувати ввічливу відповідь, замість даних з тікета
+            synthesis = await llm.ainvoke(
+                f"Користувач запитав: {state['messages'][-1].content}\n"
+                f"CRM повернув дані: {tool_res}\n"
+                f"Сформулюй ввічливу відповідь, описуючи статус тікета."
+            )
+            final_res = synthesis.content
+        else:
+            final_res = "Інструмент не знайдено"
+    else:
+        final_res = response.content
+
+    msg = AIMessage(content=final_res)
+    log_agent_step('support', state.get('step_count', 0),
+                   'mcp_tool', state['messages'][-1].content, final_res)
+    return {'messages': [msg], 'completed': True, 'step_count': state.get('step_count', 0) + 1}
+
+# ── Роутер та Граф ──
+
+
+def route(state: MASState) -> Literal['planner', 'booking', 'researcher', 'support', 'general', '__end__']:
     if state.get('completed'):
         return '__end__'
     return state.get('current_agent', 'general')
@@ -186,6 +226,7 @@ g.add_node('supervisor', supervisor_node)
 g.add_node('planner', planner_agent)
 g.add_node('booking', booking_agent)
 g.add_node('researcher', researcher_agent)
+g.add_node('support', support_agent)
 g.add_node('general', general_agent)
 
 g.add_edge(START, 'supervisor')
@@ -193,34 +234,56 @@ g.add_conditional_edges('supervisor', route)
 g.add_edge('planner', END)
 g.add_edge('booking', END)
 g.add_edge('researcher', END)
+g.add_edge('support', END)
 g.add_edge('general', END)
 
-conn = sqlite3.connect('agent_state.db', check_same_thread=False)
-saver = SqliteSaver(conn)
-app = g.compile(checkpointer=saver)
+# conn = sqlite3.connect('agent_state.db', check_same_thread=False)
+# saver = SqliteSaver(conn)
+# app = g.compile(checkpointer=saver)
 
-if __name__ == "__main__":
+
+async def main():
+    global mcp_tools
+
+    print("Підключення до MCP сервера...")
+    client = MultiServerMCPClient({
+        'support': {
+            'command': 'python',
+            'args': [os.path.abspath('mcp_server.py')],
+            'transport': 'stdio',
+        },
+    })
+    mcp_tools = await client.get_tools()
+    print(
+        f'Завантажено {len(mcp_tools)} MCP інструментів: {[t.name for t in mcp_tools]}')
+
     queries = [
         ('1', 'Сплануй поїздку з Торонто до Ванкувера на 10 жовтня 2026, знайди готель на 14 ночей.'),
         ('2', 'Будь ласка, забронюй рейс AC101 для 2 пасажирів, ціна $350.'),
-        ('3', 'Які візові правила для поїздки до Коста-Рики з Канади?')
+        ('3', 'Які візові правила для поїздки до Коста-Рики з Канади?'),
+        ('4', 'Який статус мого тікету TKT-001?')
     ]
 
-    for tid, query in queries:
-        print(f"\n{'='*70}\nЗАПИТ {tid}: {query}\n{'-'*70}")
-        config = {'configurable': {'thread_id': f'demo-mas-{tid}'}}
+    async with AsyncSqliteSaver.from_conn_string("agent_state.db") as saver:
+        app = g.compile(checkpointer=saver)
+        for tid, query in queries:
+            print(f"\nЗапит {tid}: {query}\n")
+            config = {'configurable': {'thread_id': f'demo-mas-{tid}'}}
 
-        initial_state = {
-            'messages': [HumanMessage(content=query)],
-            'current_agent': '',
-            'plan': [], 'current_step': 0, 'results': [],
-            'step_count': 0, 'start_time': time.time(),
-            'completed': False
-        }
+            initial_state = {
+                'messages': [HumanMessage(content=query)],
+                'current_agent': '',
+                'plan': [], 'current_step': 0, 'results': [],
+                'step_count': 0, 'start_time': time.time(),
+                'completed': False
+            }
 
-        result = app.invoke(initial_state, config=config)
+            result = await app.ainvoke(initial_state, config=config)
 
-        print(
-            f"[{result['current_agent'].upper()}] Відповідь: {result['messages'][-1].content}")
+            print(
+                f"[{result['current_agent'].upper()}] Відповідь: {result['messages'][-1].content}")
 
     logger.save('trajectory_mas.json')
+
+if __name__ == "__main__":
+    asyncio.run(main())
