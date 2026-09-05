@@ -1,3 +1,4 @@
+import observability  # Ініціалізація LangSmith Tracing
 import warnings
 import asyncio
 import os

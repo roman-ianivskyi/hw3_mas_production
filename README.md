@@ -108,3 +108,16 @@ Result: Блокується Tool Guardrail (allowlist), повертаєтьс�
   > `[HITL] support намагається виконати: update_ticket_status. Очікування підтвердження...`
   > `➡ Відправка підтвердження оператором...`
  *(Після підтвердження (Approve), агент успішно завершує дію та генерує звіт).*
+
+ ## Observability
+
+ *(Вимагає конфігурації LANGCHAIN_API_KEY/LANGSMITH_API_KEY у .env)*
+
+ Приклад трейсу:
+![HITL](image.png)
+![Ієрархія агентів](image-1.png)
+PII:
+ https://smith.langchain.com/public/8a1a7969-c1a5-4ae9-96f8-617e028ce2cd/r/01a0722a-db89-7511-9f4e-836641316321?start_time=2026-09-05T15%3A23%3A26.47309Z
+
+HITL:
+ https://smith.langchain.com/public/04b5ca24-5c02-4d0f-a796-1a6cac213b62/r/01a0722b-2c2f-78c1-81a0-d61f4b3a392a?start_time=2026-09-05T15%3A23%3A47.119843Z
