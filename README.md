@@ -129,8 +129,6 @@ python red_team.py
 2. Перевірка збереженого стану (State Check)
 У цей момент процес може бути повністю завершений. Ми можемо прочитати збережений стан з бази даних у будь-який час, використовуючи той самий thread_id:
 
-Python
-# Читання стану з БД після зупинки програми
 ```python
 config = {'configurable': {'thread_id': 'hitl-approve'}}
 saved_state = await app.aget_state(config)
